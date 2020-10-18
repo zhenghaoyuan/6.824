@@ -17,14 +17,16 @@ package raft
 //   in the same server.
 //
 
-import "sync"
+import (
+	"fmt"
+	"sync"
+	"time"
+)
 import "sync/atomic"
 import "../labrpc"
 
 // import "bytes"
 // import "../labgob"
-
-
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -47,26 +49,42 @@ type ApplyMsg struct {
 // A Go object implementing a single Raft peer.
 //
 type Raft struct {
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state
-	peers     []*labrpc.ClientEnd // RPC end points of all peers
-	persister *Persister          // Object to hold this peer's persisted state
-	me        int                 // this peer's index into peers[]
-	dead      int32               // set by Kill()
-
+	mu           sync.Mutex          // Lock to protect shared access to this peer's state
+	peers        []*labrpc.ClientEnd // RPC end points of all peers
+	persister    *Persister          // Object to hold this peer's persisted state
+	me           int                 // this peer's index into peers[]
+	dead         int32               // set by Kill()
+	term         int                 // Initial a term number.
+	status       int                 // 0 is leader, 1 is follower, 2 is candidate.
+	timeOut      int                 // Config of time out for waiting for heart beat
+	randRange    [2]int              // Range of the rand re vote.
+	isLeader     bool
+	getHeartbeat chan int // channel to indicates that receive heartbeats.
+	applyCh      chan ApplyMsg
+	logs         []LogEntry
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
+	rf.mu.Lock()
+	term := rf.term
+	isLeader := rf.isLeader
+	rf.mu.Unlock()
+	return term, isLeader
+}
 
-	var term int
-	var isleader bool
-	// Your code here (2A).
-	return term, isleader
+// Return all status, it is used by internal functions.
+func (rf *Raft) getState() (int, int, bool) {
+	rf.mu.Lock()
+	term := rf.term
+	isLeader := rf.isLeader
+	status := rf.status
+	rf.mu.Unlock()
+	return term, status, isLeader
 }
 
 //
@@ -84,7 +102,6 @@ func (rf *Raft) persist() {
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
 }
-
 
 //
 // restore previously persisted state.
@@ -108,15 +125,34 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
+type AppendEntriesArgs struct {
+	Term    int
+	LeadId  int
+	Entries []LogEntry
+}
 
+type LogEntry struct {
+	// Term of the LogEntry
+	Term int
+	// Key of the LogEntry
+	Key int32
+	// value of the LogEntry
+	Value int32
+}
 
+type AppendEntriesReply struct {
+	Term int
+}
 
 //
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 //
 type RequestVoteArgs struct {
-	// Your data here (2A, 2B).
+	// Term indicates current term of the candidates.
+	Term int
+	// Candidate id
+	CandidateId int32
 }
 
 //
@@ -124,14 +160,35 @@ type RequestVoteArgs struct {
 // field names must start with capital letters!
 //
 type RequestVoteReply struct {
-	// Your data here (2A).
+	Term int
+	// CandidateId of this Reply
+	CandidateId int32
+	// Candidate vote result.
+	VoteResult int32
 }
 
 //
 // example RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (2A, 2B).
+
+}
+
+// AppendEntries RPC handler
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	// If the term of heartbeat is smaller than the server, ignore this rpc.
+	term, _ := rf.GetState()
+	if args.Term < term {
+		return
+	}
+
+	// Receive an heartbeat, update getHeartBeat channel.
+	if len(args.Entries) == 0 {
+		rf.getHeartbeat <- 0
+	}
+
+	reply.Term = rf.term
+	return
 }
 
 //
@@ -168,6 +225,56 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+// For 2A, it is just for sending heartbeats periodically. For 2b,c, it sends some real value to log.
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
+// Run a gorountine to send out heart beat periodically.
+func (rf *Raft) initHeartBeatSend() {
+	for {
+		_, isLeader := rf.GetState()
+		// Send heartbeat every seconds to all peer servers, if the current server thinks it is the leader.
+		if isLeader {
+			for i := range rf.peers {
+				args := &AppendEntriesArgs{rf.term, rf.me, []LogEntry{}}
+				reply := &AppendEntriesReply{}
+				if i != rf.me {
+					go rf.sendAppendEntries(i, args, reply)
+				}
+
+			}
+		}
+		time.Sleep(1 * time.Second)
+	}
+}
+
+// Initilizaiton function to listen to the heartbeat, if there not receiving heartbeat after TIME_OUT, change
+// back to candidate states.
+func (rf *Raft) initHeartBeatReceive() {
+	for {
+		select {
+		case <-rf.getHeartbeat:
+			fmt.Println(time.Now())
+			fmt.Println("Get a heartbeat at")
+		case <-time.After(2 * time.Second):
+			go rf.startVote()
+		}
+	}
+}
+
+// Become a candidate and start a vote. This procedures ends only if a leader has been selected.
+func (rf *Raft) startVote() {
+}
+
+func (rf *Raft) initElectionSend() {
+
+}
+
+func (rf *Raft) initElectionReceive() {
+
+}
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
@@ -184,12 +291,12 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
+
 	index := -1
 	term := -1
 	isLeader := true
 
 	// Your code here (2B).
-
 
 	return index, term, isLeader
 }
@@ -232,12 +339,16 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
-
+	rf.applyCh = applyCh
 	// Your initialization code here (2A, 2B, 2C).
-
+	//
+	rf.status = 2
+	rf.isLeader = false
+	go rf.initHeartBeatSend()
+	go rf.initHeartBeatReceive()
+	go rf.initElectionSend()
+	go rf.initElectionReceive()
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-
-
 	return rf
 }
